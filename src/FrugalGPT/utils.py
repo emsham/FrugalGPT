@@ -1,5 +1,5 @@
-import json
 import csv
+from .config import load_service_info
 
 def help():
     print("Welcome to use FrugalGPT!")
@@ -8,7 +8,12 @@ def help():
     return 
 
 def getservicename(configpath='config/serviceinfo.json'):
-    service = json.load(open(configpath))
+    if configpath != 'config/serviceinfo.json':
+        import json
+
+        service = json.load(open(configpath))
+    else:
+        service = load_service_info()
     names = [provider + "/" + name for provider in service.keys() for name in service[provider]]
     return names
 

@@ -1,4 +1,4 @@
-from modelservice import make_model
+from service.modelservice import make_model
 import os, requests, numpy, argparse
 
 def main(): 

@@ -6,13 +6,17 @@ Created on Mon Oct  3 21:06:55 2022
 """
 
 import os, time
-import smart_open
 import json
 import re
 import urllib.request
 
 import string
 from collections import Counter
+
+try:
+    import smart_open
+except ImportError:
+    smart_open = None
 
 def compute_cost(
                  input_size,
@@ -42,6 +46,9 @@ def load_http_text(url):
 def load_text(path):
     if path.startswith("http://") or path.startswith("https://"):
         return load_http_text(path)
+    elif smart_open is None:
+        with open(path) as f:
+            return f.read()
     else:
         with smart_open.open(path) as f:
             return f.read()
@@ -57,11 +64,13 @@ def load_json_lines(path):
 
 
 def dump_json(data, path):
-    with smart_open.open(path, "w") as f:
+    opener = smart_open.open if smart_open is not None else open
+    with opener(path, "w") as f:
         json.dump(data, f)
 
 def dump_json_lines(data, path):
-    with smart_open.open(path, mode='w') as f:
+    opener = smart_open.open if smart_open is not None else open
+    with opener(path, mode='w') as f:
         for i in range(len(data)):
             f.write(json.dumps(data[i]))
             f.write("\n")
@@ -69,7 +78,8 @@ def dump_json_lines(data, path):
 
 
 def dump_dataframe(df, path):
-    with smart_open.open(path, "w") as f:
+    opener = smart_open.open if smart_open is not None else open
+    with opener(path, "w") as f:
         df.to_csv(f, index=False)
 
 
@@ -135,12 +145,12 @@ def normalize_answer(s,normal_method=""):
         return text.lower()
 
     def mc_remove(text):
-        a1 = re.findall('\([a-zA-Z]\)', text)
+        a1 = re.findall(r'\([a-zA-Z]\)', text)
         #print("text is",text)
         #print("a1",a1)
         if(len(a1)==0):
             return ""
-        return re.findall('\([a-zA-Z]\)', text)[-1]
+        return re.findall(r'\([a-zA-Z]\)', text)[-1]
     if(normal_method=="mc"):
         return mc_remove(s)
     return white_space_fix(remove_articles(remove_punc(lower(s))))

@@ -1,0 +1,3 @@
+include config/serviceinfo.json
+include config/serviceidmap.json
+recursive-include config/prompt *.txt
