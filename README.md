@@ -57,6 +57,18 @@ python examples/business_support_triage_demo.py
 
 The demo uses local fake providers to compare a cheap-first cascade against a strong-model-only baseline before any live API spend.
 
+Run the CSV-based business ticket eval:
+
+```
+python examples/business_ticket_eval.py \
+  --input examples/business_tickets_sample.csv \
+  --output /tmp/frugalgpt_ticket_eval.csv \
+  --compare-strong-only
+```
+
+The output CSV includes predicted routing, cost, correctness columns, and blank human-review fields.
+Input rows should include `ticket_id` and `text`; optional labels are `expected_category`, `expected_urgency`, and `expected_escalation`.
+
 
 
 ## 📚 Read More

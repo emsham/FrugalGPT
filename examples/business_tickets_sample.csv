@@ -1,0 +1,6 @@
+ticket_id,text,expected_category,expected_urgency,expected_escalation
+T-1001,Customer reports a duplicate charge and asks for a refund.,billing,normal,false
+T-1002,Prospect wants pricing for 80 seats and a security review.,sales,high,true
+T-1003,The API integration is returning 500 errors after deploy.,technical,normal,false
+T-1004,Customer asks how to change their notification email.,general,normal,false
+T-1005,Enterprise customer says login is down and they may cancel.,technical,high,true

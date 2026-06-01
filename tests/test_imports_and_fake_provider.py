@@ -1,4 +1,6 @@
 import json
+import tempfile
+import importlib.util
 import sys
 import unittest
 from pathlib import Path
@@ -8,6 +10,14 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+
+
+def load_business_eval_module():
+    module_path = ROOT / "examples" / "business_ticket_eval.py"
+    spec = importlib.util.spec_from_file_location("business_ticket_eval", module_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class ImportAndFakeProviderTests(unittest.TestCase):
@@ -76,6 +86,49 @@ class ImportAndFakeProviderTests(unittest.TestCase):
         self.assertTrue((result["cost"] > 0).all())
         categories = {json.loads(answer)["category"] for answer in result["answer"]}
         self.assertEqual(categories, {"billing", "sales", "technical"})
+
+    def test_business_ticket_eval_writes_reviewable_csv(self):
+        module = load_business_eval_module()
+        cheap_service = module.make_service("fake/support-cheap")
+        strong_service = module.make_service("fake/support-strong")
+        rows = [
+            {
+                "ticket_id": "T-1",
+                "text": "Customer says login is down and they may cancel.",
+                "expected_category": "technical",
+                "expected_urgency": "high",
+                "expected_escalation": "true",
+            },
+            {
+                "ticket_id": "T-2",
+                "text": "Customer asks how to update their notification email.",
+                "expected_category": "general",
+                "expected_urgency": "normal",
+                "expected_escalation": "false",
+            },
+        ]
+
+        output_rows, cascade_total, strong_only_total = module.evaluate_rows(
+            rows,
+            cheap_service,
+            "fake/support-cheap",
+            strong_service,
+            "fake/support-strong",
+            confidence_threshold=0.7,
+            compare_strong_only=True,
+        )
+
+        self.assertEqual(len(output_rows), 2)
+        self.assertGreater(cascade_total, 0)
+        self.assertGreater(strong_only_total, 0)
+        self.assertEqual(output_rows[0]["routed_to"], "strong")
+        self.assertEqual(output_rows[1]["routed_to"], "cheap")
+        self.assertIn("review_decision", output_rows[0])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "eval.csv"
+            module.write_output(output_path, output_rows)
+            self.assertIn("reviewer_notes", output_path.read_text())
 
 
 if __name__ == "__main__":
