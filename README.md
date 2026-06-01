@@ -69,6 +69,20 @@ python examples/business_ticket_eval.py \
 The output CSV includes predicted routing, cost, correctness columns, and blank human-review fields.
 Input rows should include `ticket_id` and `text`; optional labels are `expected_category`, `expected_urgency`, and `expected_escalation`.
 
+Plan a live pilot without making API calls:
+
+```
+python examples/business_ticket_eval.py \
+  --input /path/to/anonymized_tickets.csv \
+  --output /tmp/frugalgpt_live_eval.csv \
+  --provider-preset mixed-openai-anthropic \
+  --limit 20 \
+  --spend-cap 1.00 \
+  --dry-run
+```
+
+Then remove `--dry-run` to run it. Use `--stop-on-error` if you want the pilot to abort on the first provider or JSON-formatting failure; otherwise failures are written as rows with `status=error`.
+
 
 
 ## 📚 Read More

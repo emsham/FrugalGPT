@@ -1,7 +1,7 @@
 import json
-import tempfile
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -108,7 +108,7 @@ class ImportAndFakeProviderTests(unittest.TestCase):
             },
         ]
 
-        output_rows, cascade_total, strong_only_total = module.evaluate_rows(
+        output_rows, cascade_total, strong_only_total, baseline_cascade_total = module.evaluate_rows(
             rows,
             cheap_service,
             "fake/support-cheap",
@@ -121,14 +121,53 @@ class ImportAndFakeProviderTests(unittest.TestCase):
         self.assertEqual(len(output_rows), 2)
         self.assertGreater(cascade_total, 0)
         self.assertGreater(strong_only_total, 0)
+        self.assertEqual(cascade_total, baseline_cascade_total)
         self.assertEqual(output_rows[0]["routed_to"], "strong")
         self.assertEqual(output_rows[1]["routed_to"], "cheap")
+        self.assertEqual(output_rows[0]["status"], "ok")
         self.assertIn("review_decision", output_rows[0])
 
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "eval.csv"
             module.write_output(output_path, output_rows)
             self.assertIn("reviewer_notes", output_path.read_text())
+
+    def test_business_ticket_eval_records_provider_failures(self):
+        module = load_business_eval_module()
+        strong_service = module.make_service("fake/support-strong")
+
+        class BadService:
+            def getcompletion(self, context, genparams):
+                return {"completion": "not json", "cost": 0.01}
+
+        rows = [{"ticket_id": "T-1", "text": "This row should fail."}]
+        output_rows, cascade_total, strong_only_total, baseline_cascade_total = module.evaluate_rows(
+            rows,
+            BadService(),
+            "fake/bad",
+            strong_service,
+            "fake/support-strong",
+            confidence_threshold=0.7,
+        )
+
+        self.assertEqual(cascade_total, 0)
+        self.assertEqual(strong_only_total, 0)
+        self.assertEqual(baseline_cascade_total, 0)
+        self.assertEqual(output_rows[0]["status"], "error")
+        self.assertIn("did not return JSON", output_rows[0]["error_message"])
+
+    def test_business_ticket_eval_resolves_presets(self):
+        module = load_business_eval_module()
+
+        class Args:
+            provider_preset = "openai"
+            cheap_provider = "fake/support-cheap"
+            strong_provider = "fake/support-strong"
+
+        cheap_provider, strong_provider = module.resolve_provider_names(Args())
+        self.assertEqual(cheap_provider, "openaichat/gpt-4o-mini")
+        self.assertEqual(strong_provider, "openaichat/gpt-4o")
+        self.assertEqual(module.required_env_vars(cheap_provider, strong_provider), ["OPENAI_API_KEY"])
 
 
 if __name__ == "__main__":
