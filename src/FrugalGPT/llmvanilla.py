@@ -1,204 +1,223 @@
-from service.modelservice import make_model,GenerationParameter
-from sqlitedict import SqliteDict
-import json, logging, pandas
-from transformers import GPT2Tokenizer
-tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-from .utils import help, getservicename
-
-global mydict
-
 import concurrent.futures
+import threading
 from collections import OrderedDict
+from pathlib import Path
+
+import pandas
 from tqdm import tqdm
 
-serviceidmap = json.load(open("config/serviceidmap.json"))
+from service.modelservice import GenerationParameter, count_tokens, make_model
+from .config import load_json_config, load_service_info
+from .utils import getservicename
 
-def form_keys(service_id,
-              genparams,
-              query,
-              ):
-    mydict1 = genparams.get_dict()
-    mydict1['service_id'] = service_id
-    mydict1['query'] = query
-    return repr(mydict1)
-    
+
+def form_keys(service_id, genparams, query):
+    key_data = genparams.get_dict()
+    key_data["service_id"] = service_id
+    key_data["query"] = query
+    return repr(key_data)
+
+
 class LLMVanilla(object):
-    def __init__(self, 
-                 service_name=None,
-                 db_path="db/qa_cache.sqlite",
-                 db_path_new = 'db/HEADLINES.sqlite',
-                 max_workers=2,
-                 ):
+    def __init__(
+        self,
+        service_name=None,
+        db_path="db/qa_cache.sqlite",
+        db_path_new="db/HEADLINES.sqlite",
+        max_workers=2,
+        cache_enabled=True,
+        service_info=None,
+    ):
         self.max_workers = max_workers
-        if(service_name==None):
-            service_name = getservicename()
-        global mydict
-        mydict = SqliteDict(db_path, autocommit=True)
-        global newdict
-        newdict = SqliteDict(db_path_new, autocommit=True)
-        self.service_name = service_name
-        self.services = dict()
+        self.service_info = service_info or load_service_info()
+        self.serviceidmap = load_json_config("serviceidmap.json")
+        self.cache_enabled = cache_enabled
+        self._cache_lock = threading.RLock()
+        self._state_lock = threading.RLock()
         self.cost = 0
-        for item in service_name:
-            #provider = item.split('/')[0]
-            #name = item.split('/')[1]
-            provider, name = item.split('/', 1)
+        self.latency = "NA"
+        self.completion = None
 
-            self.services[item] = make_model(provider,name)
-        return
-    
-    def get_cost(self,):
+        if service_name is None:
+            service_name = getservicename()
+        self.service_names = list(service_name)
+        self.services = {}
+        self._service_locks = {}
+        for item in self.service_names:
+            provider, name = item.split("/", 1)
+            self.services[item] = make_model(provider, name)
+            self._service_locks[item] = threading.RLock()
+
+        self.cache = self._open_cache(db_path) if cache_enabled else {}
+        self.cache_new = self._open_cache(db_path_new) if cache_enabled else {}
+
+    def _open_cache(self, db_path):
+        try:
+            from sqlitedict import SqliteDict
+        except ImportError as exc:
+            raise RuntimeError(
+                "sqlitedict is required for FrugalGPT caching. "
+                "Install it or pass cache_enabled=False."
+            ) from exc
+
+        path = Path(db_path)
+        if path.parent != Path("."):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        return SqliteDict(str(path), autocommit=True)
+
+    def get_cost(self):
         return self.cost
-    
-    def compute_cost(self,
-                     input_text,
-                     output_text,
-                     service_name):
-        cost = 0
-        input_size = len(tokenizer(input_text)['input_ids'])
-        gen_size = len(tokenizer(output_text)['input_ids']) 
-        
-        service_all = self.service_name
-    
-        
-        cost_output = service_all[service_name]["cost_output"]
-        cost_input = service_all[service_name]["cost_input"]
-        cost_fixed = service_all[service_name]["cost_fixed"]
-        fixed_size = service_all[service_name]["fixed_size"]
-        
-        cost = cost_input*input_size + cost_fixed
-        if(gen_size>fixed_size):
-            cost += cost_output*(gen_size - fixed_size)    
-        
-        return cost 
 
-    def costestimate(self,
-                     query:str,
-                     service_name = "20000",
-                     Params = GenerationParameter(max_tokens=50, 
-                                                   temperature=0.1,
-                                                   stop=["\n"],
-                      )
-                     ):
-        max_token = Params.max_tokens
-        cost = self.compute_cost(input_text = query,
-                                 output_text = 'token '*max_token,
-                                 service_name=service_name,) 
-        
+    def compute_cost(self, input_text, output_text, service_name):
+        provider, model = service_name.split("/", 1)
+        try:
+            service_info = self.service_info[provider][model]
+        except KeyError as exc:
+            raise KeyError(f"No service cost config for {service_name}") from exc
+
+        input_size = count_tokens(input_text)
+        gen_size = count_tokens(output_text)
+        cost = service_info["cost_input"] * input_size + service_info["cost_fixed"]
+        if gen_size > service_info["fixed_size"]:
+            cost += service_info["cost_output"] * (gen_size - service_info["fixed_size"])
         return cost
 
-    
-    def get_completion(self, 
-                      query:str,
-                      service_name = "20000",
-                      use_save=False,
-                      use_db = True,
-                      savepath="raw.pkl",
-                      genparams = GenerationParameter(max_tokens=50, 
-                                                   temperature=0.1,
-                                                   stop=["\n"],
-),
-                      migrate_db=False,
-                      ):
+    def costestimate(
+        self,
+        query: str,
+        service_name="fake/support-cheap",
+        Params=GenerationParameter(max_tokens=50, temperature=0.1, stop=["\n"]),
+    ):
+        return self.compute_cost(
+            input_text=query,
+            output_text="token " * Params.max_tokens,
+            service_name=service_name,
+        )
+
+    def _cache_key(self, service_name, genparams, query):
+        service_id = self.serviceidmap.get(service_name, service_name)
+        return form_keys(service_id=service_id, genparams=genparams, query=query)
+
+    def _cache_get(self, key):
+        if not self.cache_enabled:
+            return None
+        with self._cache_lock:
+            value = self.cache.get(key)
+            if value is not None and "cost" in value:
+                self.cache_new[key] = value
+                return value
+        return None
+
+    def _cache_set(self, key, value):
+        if not self.cache_enabled:
+            return
+        with self._cache_lock:
+            self.cache[key] = value
+
+    def _get_completion_record(
+        self,
+        query: str,
+        service_name="fake/support-cheap",
+        use_save=False,
+        use_db=True,
+        savepath="raw.pkl",
+        genparams=GenerationParameter(max_tokens=50, temperature=0.1, stop=["\n"]),
+    ):
         model = self.services[service_name]
-        key = service_name+"_"+query
-        #logging.critical("Service name is{}".format(service_name))
+        key = self._cache_key(service_name, genparams, query)
+        completion = self._cache_get(key) if use_db else None
 
-        if(service_name in serviceidmap):
-            key = form_keys(service_id=serviceidmap[service_name], genparams=genparams, query=query)
-        else:
-            key = form_keys(service_id=service_name, genparams=genparams, query=query)
-        if((key in mydict )and ('cost' in mydict[key]) ):
-            #logging.critical("Use cached results! for key{}".format(key))
+        if completion is None:
+            with self._service_locks[service_name]:
+                completion = model.getcompletion(
+                    query,
+                    use_save=use_save,
+                    savepath=savepath,
+                    genparams=genparams,
+                )
+            if use_db:
+                self._cache_set(key, completion)
 
-            completion = mydict[key]
-            newdict[key] = mydict[key]
-        else:
-            print("---invoke new API call---")
-            print(service_name)
-            #print(query)
-            completion = model.getcompletion(query,
-                                         use_save=use_save,
-                                         genparams=genparams)  
-            mydict[key] = completion
-     
-        if(use_db==False):
-            completion = model.getcompletion(query,
-                                         use_save=use_save,
-                                         genparams=genparams)
-            mydict[key] = completion
-            #print("do not use stored results!")
         try:
-            cost =completion['cost']
-        except:
-            cost = self.compute_cost(input_text = query,
-                                 output_text = completion['completion'],
-                                 service_name=service_name,)    
-        self.cost = cost
-        self.completion = completion 
-        if('latency' not in completion):
-            self.latency = 'NA'
-        else:
-            self.latency = completion['latency']    
-        return completion['completion']
+            cost = completion["cost"]
+        except KeyError:
+            cost = self.compute_cost(
+                input_text=query,
+                output_text=completion["completion"],
+                service_name=service_name,
+            )
+        latency = completion.get("latency", "NA")
+        return {
+            "answer": completion["completion"],
+            "cost": cost,
+            "latency": latency,
+            "completion": completion,
+        }
 
-    def get_completion_allservice(self, 
-                      query:str,
-                      service_names = [''],
-                      use_save=False,
-                      use_db = True,
-                      savepath="raw.pkl",
-                      genparams = GenerationParameter(max_tokens=50, 
-                                                   temperature=0.1,
-                                                   stop=["\n"],
-),
-                      ):
-        result = list()
+    def get_completion(
+        self,
+        query: str,
+        service_name="fake/support-cheap",
+        use_save=False,
+        use_db=True,
+        savepath="raw.pkl",
+        genparams=GenerationParameter(max_tokens=50, temperature=0.1, stop=["\n"]),
+        migrate_db=False,
+    ):
+        record = self._get_completion_record(
+            query=query,
+            service_name=service_name,
+            use_save=use_save,
+            use_db=use_db,
+            savepath=savepath,
+            genparams=genparams,
+        )
+        with self._state_lock:
+            self.cost = record["cost"]
+            self.completion = record["completion"]
+            self.latency = record["latency"]
+        return record["answer"]
+
+    def get_completion_allservice(
+        self,
+        query: str,
+        service_names=None,
+        use_save=False,
+        use_db=True,
+        savepath="raw.pkl",
+        genparams=GenerationParameter(max_tokens=50, temperature=0.1, stop=["\n"]),
+    ):
+        if service_names is None:
+            service_names = []
+        result = []
         for name in service_names:
-            answer = self.get_completion(query=query,
-                                         service_name=name,
-                                         use_save=use_save,
-                                         use_db=use_db,
-                                         savepath=savepath,
-                                         genparams=genparams,
-                                         )    
-            cost = self.get_cost()
-            result.append({'service':name,'answer':answer,'cost':cost})
-        result = pandas.DataFrame(result)
-        return result
-    
-    def get_completion_batch(self, 
-                      queries:[],
-                      service_name = '',
-                      use_save=False,
-                      use_db = True,
-                      savepath="raw.pkl",
-                      genparams = GenerationParameter(max_tokens=50, 
-                                                   temperature=0.1,
-                                                   stop=["\n"],
-),
-                      ):
-        '''
-        result = list()
-        for query in queries:
-            answer = self.get_completion(query=query[0],
-                                         service_name=service_name,
-                                         use_save=use_save,
-                                         use_db=use_db,
-                                         savepath=savepath,
-                                         genparams=genparams,
-                                         )    
-            #print(answer)
-            cost = self.get_cost()
-            result.append({'_id':query[2],'answer':answer,'ref_answer':query[1],'cost':cost})
-        '''
-        result = self.parallel_process_queries(queries, service_name, use_save, use_db, savepath, genparams)
-        #print(f"result is {result}")
-        result = pandas.DataFrame(result)
-        return result
-    
+            record = self._get_completion_record(
+                query=query,
+                service_name=name,
+                use_save=use_save,
+                use_db=use_db,
+                savepath=savepath,
+                genparams=genparams,
+            )
+            result.append({"service": name, "answer": record["answer"], "cost": record["cost"]})
+        return pandas.DataFrame(result)
+
+    def get_completion_batch(
+        self,
+        queries,
+        service_name="fake/support-cheap",
+        use_save=False,
+        use_db=True,
+        savepath="raw.pkl",
+        genparams=GenerationParameter(max_tokens=50, temperature=0.1, stop=["\n"]),
+    ):
+        result = self.parallel_process_queries(
+            queries, service_name, use_save, use_db, savepath, genparams
+        )
+        return pandas.DataFrame(result)
+
     def process_query(self, query, service_name, use_save, use_db, savepath, genparams):
-        answer = self.get_completion(
+        record = self._get_completion_record(
             query=query[0],
             service_name=service_name,
             use_save=use_save,
@@ -206,12 +225,16 @@ class LLMVanilla(object):
             savepath=savepath,
             genparams=genparams,
         )
-        cost = self.get_cost()
-        return {'_id': query[2], 'answer': answer, 'ref_answer': query[1], 'cost': cost}
+        return {
+            "_id": query[2],
+            "answer": record["answer"],
+            "ref_answer": query[1],
+            "cost": record["cost"],
+        }
 
     def parallel_process_queries(self, queries, service_name, use_save, use_db, savepath, genparams):
         result = OrderedDict()
-        
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_query = {
                 executor.submit(
@@ -221,29 +244,28 @@ class LLMVanilla(object):
                     use_save,
                     use_db,
                     savepath,
-                    genparams
-                ): query for query in queries
+                    genparams,
+                ): query
+                for query in queries
             }
-            
-            for future in tqdm(concurrent.futures.as_completed(future_to_query)):
+
+            for future in tqdm(concurrent.futures.as_completed(future_to_query), total=len(future_to_query)):
                 query = future_to_query[future]
                 try:
                     data = future.result()
                     result[query[2]] = data
                 except Exception as exc:
-                    print(f'Query {query} generated an exception: {exc}')
-        
+                    print(f"Query {query} generated an exception: {exc}")
+
         return list(result.values())
 
-    def get_last_cost(self,
-                      ):
-        #print("completion with cost",self.completion)
-        return self.completion['cost']
-    
+    def get_last_cost(self):
+        return self.completion["cost"]
+
     def get_latency(self):
         return self.latency
 
-    def reset(self,
-              ):
-        self.cost = 0
-        self.completion = None
+    def reset(self):
+        with self._state_lock:
+            self.cost = 0
+            self.completion = None

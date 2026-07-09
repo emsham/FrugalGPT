@@ -27,6 +27,62 @@ wget -P db/ https://github.com/lchen001/DataHolder/releases/download/v0.0.1/qa_c
 
 Now you are ready to use the [local intro notebook](intro.ipynb)!
 
+For development, install the package from a local checkout:
+
+```
+pip install -e .
+```
+
+Provider SDKs are optional and loaded only when that provider is used:
+
+```
+pip install -e ".[ai21]"
+pip install -e ".[anthropic]"
+pip install -e ".[cohere]"
+pip install -e ".[google]"
+pip install -e ".[scoring]"
+```
+
+Run the lightweight test suite without API keys:
+
+```
+PYTHONPATH=src python -m unittest discover -s tests -v
+```
+
+Run the deterministic customer-support triage demo:
+
+```
+python examples/business_support_triage_demo.py
+```
+
+The demo uses local fake providers to compare a cheap-first cascade against a strong-model-only baseline before any live API spend.
+
+Run the CSV-based business ticket eval:
+
+```
+python examples/business_ticket_eval.py \
+  --input examples/business_tickets_sample.csv \
+  --output /tmp/frugalgpt_ticket_eval.csv \
+  --compare-strong-only
+```
+
+The output CSV includes predicted routing, cost, correctness columns, and blank human-review fields.
+Input rows should include `ticket_id` and `text`; optional labels are `expected_category`, `expected_urgency`, and `expected_escalation`.
+
+Plan a live pilot without making API calls:
+
+```
+python examples/business_ticket_eval.py \
+  --input /path/to/anonymized_tickets.csv \
+  --output /tmp/frugalgpt_live_eval.csv \
+  --provider-preset mixed-openai-anthropic \
+  --limit 20 \
+  --spend-cap 1.00 \
+  --dry-run
+```
+
+Then remove `--dry-run` to run it. Use `--stop-on-error` if you want the pilot to abort on the first provider or JSON-formatting failure; otherwise failures are written as rows with `status=error`.
+
 
 
 ## 📚 Read More
